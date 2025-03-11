@@ -68,7 +68,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: yourusername/cicd-demo-app
+          images: levisstrauss/cicd-demo-app
           tags: |
             type=sha,prefix=,suffix=,format=short
             type=semver,pattern={{version}}
