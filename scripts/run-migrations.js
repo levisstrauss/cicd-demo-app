@@ -25,7 +25,7 @@ async function runMigrations() {
   let client;
   
   try {
-    console.log('Starting database migrations...');
+    console.error('Starting database migrations...');
     
     // Get a client from the pool
     client = await pool.connect();
@@ -35,7 +35,7 @@ async function runMigrations() {
     
     // Get list of already applied migrations
     const result = await client.query(
-      "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'schema_migrations')"
+      'SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = "schema_migrations")'
     );
     
     // If schema_migrations table doesn't exist yet, we won't have any applied migrations
@@ -45,14 +45,14 @@ async function runMigrations() {
       appliedMigrations = rows.map(row => row.version);
     }
     
-    console.log(`Found ${appliedMigrations.length} previously applied migrations`);
+    console.error(`Found ${appliedMigrations.length} previously applied migrations`);
     
     // Get all migration files
     const migrationFiles = fs.readdirSync(migrationsDir)
       .filter(file => file.endsWith('.sql'))
       .sort(); // Ensure we apply migrations in order
     
-    console.log(`Found ${migrationFiles.length} migration files`);
+    console.error(`Found ${migrationFiles.length} migration files`);
     
     // Apply migrations that haven't been applied yet
     let appliedCount = 0;
@@ -60,11 +60,11 @@ async function runMigrations() {
       const migrationName = file.replace('.sql', '');
       
       if (appliedMigrations.includes(migrationName)) {
-        console.log(`Skipping already applied migration: ${file}`);
+        console.error(`Skipping already applied migration: ${file}`);
         continue;
       }
       
-      console.log(`Applying migration: ${file}`);
+      console.error(`Applying migration: ${file}`);
       
       // Read and execute the migration
       const filePath = path.join(migrationsDir, file);
@@ -73,14 +73,14 @@ async function runMigrations() {
       await client.query(sql);
       appliedCount++;
       
-      console.log(`Successfully applied migration: ${file}`);
+      console.error(`Successfully applied migration: ${file}`);
     }
     
     // Commit the transaction
     await client.query('COMMIT');
     
-    console.log(`Applied ${appliedCount} new migrations`);
-    console.log('Database migrations completed successfully');
+    console.error(`Applied ${appliedCount} new migrations`);
+    console.error('Database migrations completed successfully');
     
   } catch (err) {
     // Rollback the transaction in case of error
