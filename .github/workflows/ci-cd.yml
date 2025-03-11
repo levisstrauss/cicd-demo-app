@@ -1,0 +1,464 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ======= CI Phase =======
+  ci:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Lint code
+        run: npm run lint
+      
+      - name: Run unit tests
+        run: npm run test:unit
+      
+      - name: Run integration tests
+        run: npm run test:integration
+      
+      - name: Check test coverage
+        run: npm test
+      
+      - name: Scan for vulnerabilities
+        run: npm audit --audit-level=high
+      
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage/
+  
+  # ======= Build Phase =======
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: yourusername/cicd-demo-app
+          tags: |
+            type=sha,prefix=,suffix=,format=short
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+            type=raw,value=latest
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+  
+  # ======= Deploy to Staging with Terraform (Blue-Green) =======
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.4.6"
+      
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+      
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate
+      
+      - name: Get current active environment
+        working-directory: ./terraform
+        id: current-env
+        run: |
+          terraform output active_environment || echo "active_environment=blue" >> $GITHUB_OUTPUT
+          echo "First deployment, using blue as default"
+      
+      - name: Determine target environment
+        id: target-env
+        run: |
+          CURRENT_ENV=${{ steps.current-env.outputs.active_environment || 'blue' }}
+          if [ "$CURRENT_ENV" == "blue" ]; then
+            echo "target_environment=green" >> $GITHUB_OUTPUT
+            echo "Target environment: green"
+          else
+            echo "target_environment=blue" >> $GITHUB_OUTPUT
+            echo "Target environment: blue"
+          fi
+      
+      - name: Terraform Plan for Staging
+        working-directory: ./terraform
+        run: |
+          terraform plan \
+            -var-file=environments/staging.tfvars \
+            -var="${{ steps.target-env.outputs.target_environment }}_version=${{ github.sha }}" \
+            -var="vpc_id=${{ secrets.VPC_ID }}" \
+            -var="subnet_ids=['${{ secrets.SUBNET_ID_1 }}','${{ secrets.SUBNET_ID_2 }}']" \
+            -out=tfplan
+      
+      - name: Terraform Apply for Staging
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+      
+      - name: Get ECS Deployment Status
+        run: |
+          # Wait for ECS service to be stable
+          aws ecs wait services-stable \
+            --cluster $(terraform -chdir=./terraform output -raw cluster_name) \
+            --services cicd-demo-service-${{ steps.target-env.outputs.target_environment }}-staging
+          
+          # Store the test URL for the new deployment
+          echo "STAGING_URL=$(terraform -chdir=./terraform output -raw test_environment_url)" >> $GITHUB_ENV
+  
+  # ======= Run E2E Tests on Staging =======
+  test-staging:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run Cypress E2E tests
+        uses: cypress-io/github-action@v5
+        with:
+          config: baseUrl=${{ env.STAGING_URL }}
+      
+      - name: Upload Cypress test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: cypress-results
+          path: |
+            cypress/videos/
+            cypress/screenshots/
+            cypress/results/
+      
+      - name: Run Load Tests
+        run: |
+          # Install k6
+          curl -L https://github.com/grafana/k6/releases/download/v0.44.0/k6-v0.44.0-linux-amd64.tar.gz | tar xz
+          sudo cp k6-v0.44.0-linux-amd64/k6 /usr/local/bin
+          
+          # Replace localhost with the staging URL in the load test script
+          sed -i "s|http://localhost:3000|${{ env.STAGING_URL }}|g" k6/load-test.js
+          
+          # Run load tests with reduced load for CI pipeline
+          k6 run --vus 5 --duration 30s k6/load-test.js
+      
+      - name: Upload Load Test Results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: load-test-results
+          path: summary.json
+  
+  # ======= Deploy to Production with Terraform (Blue-Green) =======
+  deploy-production:
+    needs: test-staging
+    runs-on: ubuntu-latest
+    environment: production  # Requires approval in GitHub
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.4.6"
+      
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+      
+      - name: Get current active environment
+        working-directory: ./terraform
+        id: current-env
+        run: |
+          terraform output active_environment || echo "active_environment=blue" >> $GITHUB_OUTPUT
+      
+      - name: Determine target environment
+        id: target-env
+        run: |
+          CURRENT_ENV=${{ steps.current-env.outputs.active_environment || 'blue' }}
+          if [ "$CURRENT_ENV" == "blue" ]; then
+            echo "target_environment=green" >> $GITHUB_OUTPUT
+            echo "Target environment: green"
+          else
+            echo "target_environment=blue" >> $GITHUB_OUTPUT
+            echo "Target environment: blue"
+          fi
+      
+      - name: Terraform Plan for Production
+        working-directory: ./terraform
+        run: |
+          terraform plan \
+            -var-file=environments/production.tfvars \
+            -var="${{ steps.target-env.outputs.target_environment }}_version=${{ github.sha }}" \
+            -var="vpc_id=${{ secrets.VPC_ID }}" \
+            -var="subnet_ids=['${{ secrets.SUBNET_ID_1 }}','${{ secrets.SUBNET_ID_2 }}']" \
+            -out=tfplan
+      
+      - name: Terraform Apply for Production
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+      
+      - name: Get ECS Deployment Status
+        run: |
+          # Wait for ECS service to be stable
+          aws ecs wait services-stable \
+            --cluster $(terraform -chdir=./terraform output -raw cluster_name) \
+            --services cicd-demo-service-${{ steps.target-env.outputs.target_environment }}-production
+          
+          # Store the testing URL for verification
+          echo "PRODUCTION_TEST_URL=$(terraform -chdir=./terraform output -raw test_environment_url)" >> $GITHUB_ENV
+      
+      - name: Verify deployment
+        run: |
+          echo "Testing new deployment at ${{ env.PRODUCTION_TEST_URL }}"
+          # In a real setup, make HTTP requests to verify the app is responding correctly
+          curl -f ${{ env.PRODUCTION_TEST_URL }}/health || exit 1
+      
+      - name: Send deployment notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🔄 New production deployment ready for verification: ${{ github.sha }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🔄 *New production deployment ready for verification*"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*App:*\ncicd-demo-app"
+                    },
+                    {
+                      "type": "mrkdwn", 
+                      "text": "*Version:*\n${{ github.sha }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Test URL:*\n${{ env.PRODUCTION_TEST_URL }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Promote to Live"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/promote-to-live.yml/dispatch"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+  
+  # ======= Blue-Green Production Promotion =======
+  promote-to-live:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    environment: production-live  # Requires additional approval for switchover
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Make switch script executable
+        run: chmod +x ./scripts/blue-green-switch.sh
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.4.6"
+      
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+      
+      - name: Switch to new deployment
+        run: ./scripts/blue-green-switch.sh production approve
+      
+      - name: Get Production URL
+        run: |
+          echo "PRODUCTION_URL=$(terraform -chdir=./terraform output -raw production_environment_url)" >> $GITHUB_ENV
+      
+      - name: Send promotion notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚀 New version promoted to live production: ${{ github.sha }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚀 *New version promoted to live production*"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*App:*\ncicd-demo-app"
+                    },
+                    {
+                      "type": "mrkdwn", 
+                      "text": "*Version:*\n${{ github.sha }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Deployed by:*\n${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*URL:*\n${{ env.PRODUCTION_URL }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Deployment"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK github.sha }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚀 *New version deployed to production*"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*App:*\ncicd-demo-app"
+                    },
+                    {
+                      "type": "mrkdwn", 
+                      "text": "*Version:*\n${{ github.sha }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Deployed by:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Deployment"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

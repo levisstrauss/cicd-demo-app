@@ -1,0 +1,93 @@
+name: Production Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - staging
+          - production
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production-rollback  # Requires approval
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Make switch script executable
+        run: chmod +x ./scripts/blue-green-switch.sh
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.4.6"
+      
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+      
+      - name: Perform Rollback
+        run: ./scripts/blue-green-switch.sh ${{ github.event.inputs.environment }} rollback
+      
+      - name: Get Production URL
+        run: |
+          echo "PRODUCTION_URL=$(terraform -chdir=./terraform output -raw production_environment_url)" >> $GITHUB_ENV
+      
+      - name: Send rollback notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ Rollback performed for ${{ github.event.inputs.environment }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "⚠️ *Rollback performed for ${{ github.event.inputs.environment }}*"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*App:*\ncicd-demo-app"
+                    },
+                    {
+                      "type": "mrkdwn", 
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Reason:*\n${{ github.event.inputs.reason }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*URL:*\n${{ env.PRODUCTION_URL }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
