@@ -40,7 +40,7 @@ jobs:
         run: npm audit --audit-level=high
       
       - name: Upload coverage reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage/
@@ -195,7 +195,7 @@ jobs:
           config: baseUrl=${{ env.STAGING_URL }}
       
       - name: Upload Cypress test results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  
         if: always()
         with:
           name: cypress-results
@@ -217,7 +217,7 @@ jobs:
           k6 run --vus 5 --duration 30s k6/load-test.js
       
       - name: Upload Load Test Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  
         if: always()
         with:
           name: load-test-results
